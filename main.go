@@ -137,7 +137,7 @@ func readCSV(input io.Reader) <-chan Record {
 	go func() {
 		r := bufio.NewScanner(input)
 		buf := make([]byte, 0, 64*1024)
-		r.Buffer(buf, 1024*1024)
+		r.Buffer(buf, 2048*1024)
 		for r.Scan() {
 			record := strings.SplitN(r.Text(), `,`, 3)
 			key, err = hex.DecodeString(strings.TrimLeft(record[0], "0x"))

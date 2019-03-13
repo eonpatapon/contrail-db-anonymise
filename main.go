@@ -29,6 +29,10 @@ type Record struct {
 	value   *gabs.Container
 }
 
+func (r Record) String() string {
+	return fmt.Sprintf(`%s:%s:%s`, string(r.key), string(r.column1), r.value.String())
+}
+
 func (r Record) toCSV() string {
 	var value string
 	key := "0x" + hex.EncodeToString(r.key)
@@ -120,6 +124,8 @@ func readCSV(input io.Reader) (records []Record, err error) {
 		value   *gabs.Container
 	)
 	r := bufio.NewScanner(input)
+	buf := make([]byte, 0, 64*1024)
+	r.Buffer(buf, 1024*1024)
 	for r.Scan() {
 		record := strings.SplitN(r.Text(), `,`, 3)
 		key, err = hex.DecodeString(strings.TrimLeft(record[0], "0x"))
@@ -145,8 +151,8 @@ func readCSV(input io.Reader) (records []Record, err error) {
 		}
 		records = append(records, Record{key, column1, value})
 	}
-
-	return records, nil
+	err = r.Err()
+	return records, err
 }
 
 func writeCSV(records []Record, output io.Writer) {

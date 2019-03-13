@@ -209,6 +209,8 @@ func main() {
 			ipRand[i] = math_rand.Intn(255)
 		}
 
+		_ = os.Mkdir(*dst, os.ModeDir|0755)
+
 		uuid, err := os.Open(*uuidDump)
 		defer uuid.Close()
 		if err != nil {

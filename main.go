@@ -75,88 +75,104 @@ func hashFqname(fqname []string) []string {
 	return fqname
 }
 
-func anonymiseFQName(records []Record) ([]Record, error) {
-	for idx, record := range records {
-		fqname := strings.Split(string(record.column1), ":")
-		// remove last elem which is the uuid before hashing and put it back
-		hashedFqname := hashFqname(fqname[:len(fqname)-1])
-		hashedFqname = append(hashedFqname, fqname[len(fqname)-1])
-		record.column1 = []byte(strings.Join(hashedFqname, ":"))
-		records[idx] = record
-	}
-	return records, nil
-}
-
-func anonymiseUUID(records []Record) ([]Record, error) {
-	for _, record := range records {
-		switch string(record.column1) {
-		case "fq_name":
-			f := record.value.Data().([]interface{})
-			fqname := make([]string, len(f))
-			for i, c := range f {
-				fqname[i] = c.(string)
-			}
-			hashedFqname := hashFqname(fqname)
-			record.value.Set(hashedFqname)
-		case "prop:display_name":
-			displayName := hash(record.value.Bytes())
-			_, err := record.value.Set(displayName)
-			if err != nil {
-				return records, err
-			}
-		case "prop:floating_ip_address":
-			// randomize last 3 octets of public IPs
-			ip := strings.Split(record.value.Data().(string), ".")
-			for i := 1; i <= 3; i++ {
-				o, _ := strconv.Atoi(ip[i])
-				ip[i] = strconv.Itoa(o ^ ipRand[i-1])
-			}
-			record.value.Set(strings.Join(ip, "."))
+func anonymiseFQName(records <-chan Record) <-chan Record {
+	out := make(chan Record)
+	go func() {
+		for record := range records {
+			fqname := strings.Split(string(record.column1), ":")
+			// remove last elem which is the uuid before hashing and put it back
+			hashedFqname := hashFqname(fqname[:len(fqname)-1])
+			hashedFqname = append(hashedFqname, fqname[len(fqname)-1])
+			record.column1 = []byte(strings.Join(hashedFqname, ":"))
+			out <- record
 		}
-	}
-	return records, nil
+		close(out)
+	}()
+	return out
 }
 
-func readCSV(input io.Reader) (records []Record, err error) {
+func anonymiseUUID(records <-chan Record) <-chan Record {
+	out := make(chan Record)
+	go func() {
+		for record := range records {
+			switch string(record.column1) {
+			case "fq_name":
+				f := record.value.Data().([]interface{})
+				fqname := make([]string, len(f))
+				for i, c := range f {
+					fqname[i] = c.(string)
+				}
+				hashedFqname := hashFqname(fqname)
+				record.value.Set(hashedFqname)
+			case "prop:display_name":
+				displayName := hash(record.value.Bytes())
+				_, err := record.value.Set(displayName)
+				if err != nil {
+					log.Fatal(err)
+				}
+			case "prop:floating_ip_address":
+				// randomize last 3 octets of public IPs
+				ip := strings.Split(record.value.Data().(string), ".")
+				for i := 1; i <= 3; i++ {
+					o, _ := strconv.Atoi(ip[i])
+					ip[i] = strconv.Itoa(o ^ ipRand[i-1])
+				}
+				record.value.Set(strings.Join(ip, "."))
+			}
+			out <- record
+		}
+		close(out)
+	}()
+	return out
+}
+
+func readCSV(input io.Reader) <-chan Record {
+	out := make(chan Record)
 	var (
+		err     error
 		key     []byte
 		column1 []byte
 		value   *gabs.Container
 	)
-	r := bufio.NewScanner(input)
-	buf := make([]byte, 0, 64*1024)
-	r.Buffer(buf, 1024*1024)
-	for r.Scan() {
-		record := strings.SplitN(r.Text(), `,`, 3)
-		key, err = hex.DecodeString(strings.TrimLeft(record[0], "0x"))
-		if err != nil {
-			return records, err
+	go func() {
+		r := bufio.NewScanner(input)
+		buf := make([]byte, 0, 64*1024)
+		r.Buffer(buf, 1024*1024)
+		for r.Scan() {
+			record := strings.SplitN(r.Text(), `,`, 3)
+			key, err = hex.DecodeString(strings.TrimLeft(record[0], "0x"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			column1, err = hex.DecodeString(strings.TrimLeft(record[1], "0x"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			// Some values are not surrounded with ", need to add
+			// them to unquote.
+			if idx := strings.Index(record[2], `"`); idx != 0 {
+				record[2] = `"` + record[2] + `"`
+			}
+			record[2], err = strconv.Unquote(record[2])
+			if err != nil {
+				log.Fatal(err)
+			}
+			value, err = gabs.ParseJSON([]byte(record[2]))
+			if err != nil {
+				log.Fatal(err)
+			}
+			out <- Record{key, column1, value}
 		}
-		column1, err = hex.DecodeString(strings.TrimLeft(record[1], "0x"))
-		if err != nil {
-			return records, err
+		if err := r.Err(); err != nil {
+			log.Fatal(err)
 		}
-		// Some values are not surrounded with ", need to add
-		// them to unquote.
-		if idx := strings.Index(record[2], `"`); idx != 0 {
-			record[2] = `"` + record[2] + `"`
-		}
-		record[2], err = strconv.Unquote(record[2])
-		if err != nil {
-			return records, err
-		}
-		value, err = gabs.ParseJSON([]byte(record[2]))
-		if err != nil {
-			return records, err
-		}
-		records = append(records, Record{key, column1, value})
-	}
-	err = r.Err()
-	return records, err
+		close(out)
+	}()
+	return out
 }
 
-func writeCSV(records []Record, output io.Writer) {
-	for _, record := range records {
+func writeCSV(records <-chan Record, output io.Writer) {
+	for record := range records {
 		_, err := output.Write([]byte(record.toCSV() + "\n"))
 		if err != nil {
 			log.Fatal(err)
@@ -164,8 +180,19 @@ func writeCSV(records []Record, output io.Writer) {
 	}
 }
 
-func main() {
+func processFQName(input io.Reader, output io.Writer) {
+	records := readCSV(input)
+	anonRecords := anonymiseFQName(records)
+	writeCSV(anonRecords, output)
+}
 
+func processUUID(input io.Reader, output io.Writer) {
+	records := readCSV(input)
+	anonRecords := anonymiseUUID(records)
+	writeCSV(anonRecords, output)
+}
+
+func main() {
 	app := cli.App("contrail-db-anonymise", "Anonymise contrail DB dump")
 	app.Spec = "FQNAME_DUMP UUID_DUMP DST"
 	var (
@@ -203,25 +230,8 @@ func main() {
 			log.Fatal(err)
 		}
 
-		records, err := readCSV(fqname)
-		if err != nil {
-			log.Fatal(err)
-		}
-		records, err = anonymiseFQName(records)
-		if err != nil {
-			log.Fatal(err)
-		}
-		writeCSV(records, fqnameAnon)
-
-		records, err = readCSV(uuid)
-		if err != nil {
-			log.Fatal(err)
-		}
-		records, err = anonymiseUUID(records)
-		if err != nil {
-			log.Fatal(err)
-		}
-		writeCSV(records, uuidAnon)
+		processUUID(uuid, uuidAnon)
+		processFQName(fqname, fqnameAnon)
 	}
 	app.Run(os.Args)
 }
